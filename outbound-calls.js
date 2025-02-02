@@ -3,11 +3,8 @@
 import WebSocket from "ws";
 import Twilio from "twilio";
 
-// In-memory store for call tracking
-const callStore = new Map();
-
-// Call status events WebSocket clients
-const statusSubscribers = new Set();
+// Call tracking store
+const activeCallsStore = new Map();
 
 export function registerOutboundRoutes(fastify) {
   // Check for required environment variables
@@ -26,6 +23,9 @@ export function registerOutboundRoutes(fastify) {
 
   // Initialize Twilio client
   const twilioClient = new Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
+  // Store to track connected monitoring clients
+  const monitoringClients = new Set();
 
   // Helper function to get signed URL for authenticated conversations
   async function getSignedUrl() {
@@ -52,35 +52,38 @@ export function registerOutboundRoutes(fastify) {
     }
   }
 
-  // Broadcast call status to all subscribers
-  function broadcastCallStatus(callData) {
-    const message = JSON.stringify({
-      type: 'callUpdate',
-      data: callData
-    });
-    statusSubscribers.forEach(client => {
+  // Helper function to broadcast call updates to all monitoring clients
+  function broadcastCallUpdate(updateData) {
+    monitoringClients.forEach(client => {
       if (client.readyState === WebSocket.OPEN) {
-        client.send(message);
+        client.send(JSON.stringify({
+          type: 'callUpdate',
+          data: updateData
+        }));
       }
     });
   }
 
-  // Store call data
-  function updateCallStatus(callSid, status, details = {}) {
-    const existingCall = callStore.get(callSid) || {};
-    const updatedCall = {
-      ...existingCall,
-      callSid,
-      status,
-      timestamp: new Date().toISOString(),
-      ...details
-    };
-    callStore.set(callSid, updatedCall);
-    broadcastCallStatus(updatedCall);
-    return updatedCall;
-  }
+  // WebSocket endpoint for call monitoring
+  fastify.register(async (fastifyInstance) => {
+    fastifyInstance.get('/call-monitor', { websocket: true }, (connection, req) => {
+      console.log('[Monitor] New monitoring client connected');
+      monitoringClients.add(connection.socket);
 
-  // Modified outbound call route with tracking
+      // Send initial state
+      connection.socket.send(JSON.stringify({
+        type: 'initialState',
+        data: Array.from(activeCallsStore.values())
+      }));
+
+      connection.socket.on('close', () => {
+        monitoringClients.delete(connection.socket);
+        console.log('[Monitor] Client disconnected');
+      });
+    });
+  });
+
+  // Route to initiate outbound calls
   fastify.post("/outbound-call", async (request, reply) => {
     const { number, metadata = {} } = request.body;
 
@@ -92,23 +95,27 @@ export function registerOutboundRoutes(fastify) {
       const call = await twilioClient.calls.create({
         from: TWILIO_PHONE_NUMBER,
         to: number,
-        url: `https://${request.headers.host}/outbound-call-twiml`,
-        statusCallback: `https://${request.headers.host}/call-status-webhook`,
-        statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-        statusCallbackMethod: 'POST'
+        url: `https://${request.headers.host}/outbound-call-twiml`
       });
 
-      const callData = updateCallStatus(call.sid, 'initiated', {
-        from: TWILIO_PHONE_NUMBER,
+      // Track the new call
+      const callData = {
+        callSid: call.sid,
         to: number,
-        metadata
-      });
+        from: TWILIO_PHONE_NUMBER,
+        status: call.status,
+        startTime: new Date().toISOString(),
+        metadata,
+        logs: []
+      };
+      
+      activeCallsStore.set(call.sid, callData);
+      broadcastCallUpdate(callData);
 
       reply.send({ 
         success: true, 
         message: "Call initiated", 
-        callSid: call.sid,
-        callData
+        callSid: call.sid 
       });
     } catch (error) {
       console.error("Error initiating outbound call:", error);
@@ -119,58 +126,19 @@ export function registerOutboundRoutes(fastify) {
     }
   });
 
-  // Call status webhook
-  fastify.post("/call-status-webhook", async (request, reply) => {
-    const {
-      CallSid,
-      CallStatus,
-      Duration,
-      CallDuration,
-    } = request.body;
-
-    updateCallStatus(CallSid, CallStatus, {
-      duration: Duration || CallDuration
-    });
-
-    reply.send({ success: true });
-  });
-
-  // Get all calls
+  // Get call history endpoint
   fastify.get("/calls", async (request, reply) => {
-    const calls = Array.from(callStore.values());
-    reply.send({ calls });
+    reply.send(Array.from(activeCallsStore.values()));
   });
 
-  // Get specific call status
+  // Get specific call details
   fastify.get("/calls/:callSid", async (request, reply) => {
-    const { callSid } = request.params;
-    const call = callStore.get(callSid);
-    
-    if (!call) {
-      return reply.code(404).send({ error: "Call not found" });
+    const callData = activeCallsStore.get(request.params.callSid);
+    if (!callData) {
+      reply.code(404).send({ error: "Call not found" });
+      return;
     }
-    
-    reply.send(call);
-  });
-
-  // WebSocket endpoint for real-time call status updates
-  fastify.register(async (fastifyInstance) => {
-    fastifyInstance.get("/call-status", { websocket: true }, (connection, req) => {
-      console.log("[Server] New client subscribed to call status updates");
-      
-      statusSubscribers.add(connection.socket);
-
-      // Send current call status on connection
-      const currentCalls = Array.from(callStore.values());
-      connection.socket.send(JSON.stringify({
-        type: 'initialState',
-        data: currentCalls
-      }));
-
-      connection.socket.on('close', () => {
-        statusSubscribers.delete(connection.socket);
-      });
-    });
+    reply.send(callData);
   });
 
   // TwiML route for outbound calls
@@ -285,7 +253,7 @@ export function registerOutboundRoutes(fastify) {
       // Set up ElevenLabs connection
       setupElevenLabs();
 
-      // Handle messages from Twilio
+      // Handle messages from Twilio with call tracking
       ws.on("message", (message) => {
         try {
           const msg = JSON.parse(message);
@@ -295,7 +263,19 @@ export function registerOutboundRoutes(fastify) {
             case "start":
               streamSid = msg.start.streamSid;
               callSid = msg.start.callSid;
-              console.log(`[Twilio] Stream started - StreamSid: ${streamSid}, CallSid: ${callSid}`);
+              
+              // Update call status
+              if (activeCallsStore.has(callSid)) {
+                const callData = activeCallsStore.get(callSid);
+                callData.status = 'in-progress';
+                callData.streamSid = streamSid;
+                callData.logs.push({
+                  timestamp: new Date().toISOString(),
+                  event: 'call_started',
+                  details: 'Call connected successfully'
+                });
+                broadcastCallUpdate(callData);
+              }
               break;
 
             case "media":
@@ -304,13 +284,31 @@ export function registerOutboundRoutes(fastify) {
                   user_audio_chunk: Buffer.from(msg.media.payload, "base64").toString("base64")
                 };
                 elevenLabsWs.send(JSON.stringify(audioMessage));
+
+                // Log media event
+                if (callSid && activeCallsStore.has(callSid)) {
+                  const callData = activeCallsStore.get(callSid);
+                  callData.logs.push({
+                    timestamp: new Date().toISOString(),
+                    event: 'media_received',
+                    details: 'Received audio from user'
+                  });
+                }
               }
               break;
 
             case "stop":
               console.log(`[Twilio] Stream ${streamSid} ended`);
-              if (elevenLabsWs?.readyState === WebSocket.OPEN) {
-                elevenLabsWs.close();
+              if (callSid && activeCallsStore.has(callSid)) {
+                const callData = activeCallsStore.get(callSid);
+                callData.status = 'completed';
+                callData.endTime = new Date().toISOString();
+                callData.logs.push({
+                  timestamp: new Date().toISOString(),
+                  event: 'call_ended',
+                  details: 'Call completed successfully'
+                });
+                broadcastCallUpdate(callData);
               }
               break;
 
