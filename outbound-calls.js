@@ -3,6 +3,12 @@
 import WebSocket from "ws";
 import Twilio from "twilio";
 
+// In-memory store for call tracking
+const callStore = new Map();
+
+// Call status events WebSocket clients
+const statusSubscribers = new Set();
+
 export function registerOutboundRoutes(fastify) {
   // Check for required environment variables
   const { 
@@ -46,9 +52,37 @@ export function registerOutboundRoutes(fastify) {
     }
   }
 
-  // Route to initiate outbound calls
+  // Broadcast call status to all subscribers
+  function broadcastCallStatus(callData) {
+    const message = JSON.stringify({
+      type: 'callUpdate',
+      data: callData
+    });
+    statusSubscribers.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(message);
+      }
+    });
+  }
+
+  // Store call data
+  function updateCallStatus(callSid, status, details = {}) {
+    const existingCall = callStore.get(callSid) || {};
+    const updatedCall = {
+      ...existingCall,
+      callSid,
+      status,
+      timestamp: new Date().toISOString(),
+      ...details
+    };
+    callStore.set(callSid, updatedCall);
+    broadcastCallStatus(updatedCall);
+    return updatedCall;
+  }
+
+  // Modified outbound call route with tracking
   fastify.post("/outbound-call", async (request, reply) => {
-    const { number } = request.body;
+    const { number, metadata = {} } = request.body;
 
     if (!number) {
       return reply.code(400).send({ error: "Phone number is required" });
@@ -58,13 +92,23 @@ export function registerOutboundRoutes(fastify) {
       const call = await twilioClient.calls.create({
         from: TWILIO_PHONE_NUMBER,
         to: number,
-        url: `https://${request.headers.host}/outbound-call-twiml`
+        url: `https://${request.headers.host}/outbound-call-twiml`,
+        statusCallback: `https://${request.headers.host}/call-status-webhook`,
+        statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+        statusCallbackMethod: 'POST'
+      });
+
+      const callData = updateCallStatus(call.sid, 'initiated', {
+        from: TWILIO_PHONE_NUMBER,
+        to: number,
+        metadata
       });
 
       reply.send({ 
         success: true, 
         message: "Call initiated", 
-        callSid: call.sid 
+        callSid: call.sid,
+        callData
       });
     } catch (error) {
       console.error("Error initiating outbound call:", error);
@@ -73,6 +117,60 @@ export function registerOutboundRoutes(fastify) {
         error: "Failed to initiate call" 
       });
     }
+  });
+
+  // Call status webhook
+  fastify.post("/call-status-webhook", async (request, reply) => {
+    const {
+      CallSid,
+      CallStatus,
+      Duration,
+      CallDuration,
+    } = request.body;
+
+    updateCallStatus(CallSid, CallStatus, {
+      duration: Duration || CallDuration
+    });
+
+    reply.send({ success: true });
+  });
+
+  // Get all calls
+  fastify.get("/calls", async (request, reply) => {
+    const calls = Array.from(callStore.values());
+    reply.send({ calls });
+  });
+
+  // Get specific call status
+  fastify.get("/calls/:callSid", async (request, reply) => {
+    const { callSid } = request.params;
+    const call = callStore.get(callSid);
+    
+    if (!call) {
+      return reply.code(404).send({ error: "Call not found" });
+    }
+    
+    reply.send(call);
+  });
+
+  // WebSocket endpoint for real-time call status updates
+  fastify.register(async (fastifyInstance) => {
+    fastifyInstance.get("/call-status", { websocket: true }, (connection, req) => {
+      console.log("[Server] New client subscribed to call status updates");
+      
+      statusSubscribers.add(connection.socket);
+
+      // Send current call status on connection
+      const currentCalls = Array.from(callStore.values());
+      connection.socket.send(JSON.stringify({
+        type: 'initialState',
+        data: currentCalls
+      }));
+
+      connection.socket.on('close', () => {
+        statusSubscribers.delete(connection.socket);
+      });
+    });
   });
 
   // TwiML route for outbound calls
