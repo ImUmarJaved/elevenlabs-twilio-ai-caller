@@ -1,3 +1,5 @@
+// Code for authenticated inbound calls with your agent
+
 import WebSocket from "ws";
 
 export function registerInboundRoutes(fastify) {
